@@ -1,0 +1,341 @@
+---
+title: Funding and publication of research on gun violence and other leading causes
+  of death
+author: "David E. Stark, MD, MS; Nigam H. Shah, MBBS, PhD"
+date: "September 28, 2016"
+output: html_document
+---
+
+****  
+## Online Supplement  
+This [R Markdown document](http://rmarkdown.rstudio.com) contains detailed methods and annotated code enabling fully reproducible research.  
+  
+The code should be run from within the same directory as the accompanying file, `Compressed Mortality, 2004-2014.txt`. Internet access is required, as the code will retrieve data from the MEDLINE and Federal RePORTER databases. When this `.Rmd` script is run within RStudio, the script will take approximately 6 hours to complete.  
+
+****
+#### load required libraries  
+```{r, message = FALSE}
+# load libraries
+require(RCurl)
+require(XML)
+require(ggplot2)
+require(scales)
+library(pander)
+require(dplyr)
+require(RColorBrewer)
+require(ggrepel)
+require(SPARQL)
+require(gridExtra)
+```
+****     
+### CDC Mortality Rates    
+
+[CDC mortality statistics](http://wonder.cdc.gov/cmf-icd10.html) were accessed from 2004 to 2014 (the most recent year available). Results were grouped by 'Injury Mechanism & All Other Leading Causes' and sorted by mortality rate. 13 nonspecific causes of death were excluded (see below) and the top 30 causes of death were retained for further analysis.
+  
+  
+  
+**Nonspecific causes of death excluded from analysis:**
+```
+All other diseases (Residual); Symptoms, signs and abnormal clinical and laboratory findings, not elsewhere classified; Other diseases of respiratory system; Other diseases of the circulatory system; In situ neoplasms, benign neoplasms and neoplasms of uncertain or unknown behavior; Certain conditions originating in the perinatal period; Congenital malformations, deformations and chromosomal abnormalities; Unspecified Injury; Other and unspecified infectious and parasitic diseases and their sequelae; Other disorders of circulatory system; Complications of medical and surgical care; Other specified, classifiable Injury; Other specified, not elsewhere classified Injury
+```
+  
+CDC-derived causes of death were manually mapped to their corresponding Medical Subject Heading [(MeSH) term(s)](http://www.ncbi.nlm.nih.gov/mesh). Ambiguous mappings were resolved by inspecting [ICD-10 codes associated with a particular cause of death](http://wonder.cdc.gov/wonder/help/cmf.html#Injury%20Mechanism%20&%20All%20Other%20Leading%20Causes).  
+
+The  downloaded CDC file `Compressed Mortality, 2004-2014.txt` was annotated with 4 additional columns prior to importing for analysis:  
+  
+* `Remove` Flag indicating nonspecific causes of death for removal  
+* `MeSH.Terms` Mapped term(s) corresponding to CDC-derived cause of death  
+* `MeSH.IDs` Corresponding MeSH Unique ID(s)  
+* `Abbreviation` Abbreviated term used for plots  
+     
+#### Code to import CDC mortality data  
+```{r}
+# import CDC mortality data with manually mapped MeSH terms
+mortality <- read.delim("Compressed Mortality, 2004-2014.txt", stringsAsFactors=FALSE)
+
+# remove nondescript causes of death
+mortality <- filter(mortality, Remove == FALSE)
+
+# Create 'Cause' column defining injury versus non-injury
+for (row in 1:nrow(mortality)) {
+  if (substr(mortality$Injury.Mechanism...All.Other.Leading.Causes[row], start = 1, stop = 10) == 'Non-Injury') {
+    mortality$Cause[row] <- 'Non-Injury'
+  } else {
+    mortality$Cause[row] <- 'Injury'
+  }
+}
+
+# convert multiple MeSH queries into list
+convertList <- function(terms) {
+  as.list(toupper(strsplit(terms, ";")[[1]]))
+}
+mortality$MeSH.Terms <- sapply(mortality$MeSH.Terms, convertList)
+mortality$MeSH.IDs <- sapply(mortality$MeSH.IDs, convertList)
+```
+  
+****
+
+### MEDLINE Publication Volume  
+    
+For each cause of death, MEDLINE was queried for the total number of publications between 2004 and 2015 indexed with the corresponding MeSH term(s) including descendant terms (terms subsumed under a parent term within the MeSH hierarchy).  
+
+This was performed using the MEDLINE [E-utilities](http://www.ncbi.nlm.nih.gov/books/NBK25501/) API and the code below.   
+     
+#### Code to import MEDLINE publication data  
+```{r}
+# Return total number of articles for each set of MeSH queries
+
+# Generate PubMed query
+mortality$PubMed.Query <- sapply(mortality$MeSH.Terms, paste, '[mesh]', sep = '', collapse = ' OR ')
+
+getPubmedTrend <- function(query, minYear=2004, maxYear=2015) {
+  #   Retreives PubMed trend (counts results by year).
+  #   
+  #   Args:
+  #     query: <string> Search query
+  #     minYear: <int> minimum year to return
+  #     maxYear: <int> maximum year to return
+  #   Returns:
+  #     A table containing year, count
+  
+  # PubMed EUtils URL for retrieving search results counts
+  pubmed <- 'https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed;rettype=count;term='
+  # encode query as a URL
+  query <- URLencode(query)
+  curl <- getCurlHandle()
+  output <- data.frame(NULL)
+  # retrieve counts for each year in range
+  for(i in minYear:maxYear) {
+    query_year <- paste(query, '+AND+', i, '%5Bppdat%5D', sep='')
+    result <- getURL(paste(pubmed, query_year, sep = ''), curl = curl)
+    result <- xmlTreeParse(result, asText = TRUE)
+    count <- as.numeric(xmlValue(result[['doc']][['eSearchResult']][['Count']]))
+    output <- rbind(output, data.frame('Year' = i, 'Count' = count))
+  }
+  
+  return(output)
+}
+
+# For each cause of death, run PubMed query and sum total results over 2004-2015
+mortality$Publications <- NA
+x = 1
+for(query in mortality$PubMed.Query) {
+  mortality$Publications[x] <- colSums(getPubmedTrend(query, 2004, 2015))[2]
+  x=x+1
+}  
+```
+    
+****
+  
+### Federal RePORTER Funding Data  
+
+Research funding data from 2004 to 2015 (all years available) was accessed from [Federal RePORTER](https://federalreporter.nih.gov/projects/switchQueryForm?mode=Advanced), a database of projects funded by U.S. federal agencies. Projects are indexed using the computerized Research, Condition, and Disease Categorization system derived in part from MeSH. For each cause of death, Federal RePORTER was queried for the total funding awarded to projects containing corresponding MeSH terms, including descendant terms.    
+  
+#### Code to import Federal RePORTER funding data  
+```{r}
+# Import Federal ExPORTER data
+
+# Code to download zip csv files from url
+temp <- tempfile()
+download.file("https://federalreporter.nih.gov/FileDownload/DownloadFile?fileToDownload=FedRePORTER_PRJ_C_FY2004.zip",temp)
+data <- read.csv(unz(temp, "FedRePORTER_PRJ_C_FY2004.csv"), stringsAsFactors = FALSE)
+unlink(temp)
+
+FedReporter <- NA
+for(year in 2004:2015) {
+  temp <- tempfile()
+  download.file(paste('https://federalreporter.nih.gov/FileDownload/DownloadFile?fileToDownload=FedRePORTER_PRJ_C_FY',year, '.zip', sep = ''),temp)
+  data <- read.csv(unz(temp, paste('FedRePORTER_PRJ_C_FY',year, '.csv', sep = '')), stringsAsFactors = FALSE, header = FALSE, skip = 1)
+  unlink(temp)
+  FedReporter <- rbind(FedReporter, data)
+}
+colnames(FedReporter) <- c('SM_Application_ID','Project_Terms','Project_Title','Department','Agency','IC_Center','Project_Number','Project_Start_Date','Project_End_Date','Contact_PI_Project_Leader','Other_PIs','Congressional_District','DUNS_Number','Organization_Name','Organization_City','Organization_State','Organization_Zip','Organization_Country','Budget_Start_Date','Budget_End_Date','CFDA_Code','FY','FY_Total_Cost','FY_Total_Cost_Sub_Projects')
+
+# convert project terms to list and all caps
+FedReporter$Project_Terms <- sapply(FedReporter$Project_Terms, convertList)
+# convert funding NAs to zeros
+FedReporter$FY_Total_Cost[is.na(FedReporter$FY_Total_Cost)] <- 0
+```
+  
+#### MeSH term expansion    
+
+In order to ensure complete coverage of search terms, MeSH terms were expanded to include all descendant terms (MEDLINE does this automatically in its queries but Federal RePORTER does not.) The [MeSH SPARQL endpoint](https://hhs.github.io/meshrdf/sparql-and-uri-requests.html) was used to perform MeSH term expansion.  
+  
+```{r}
+# For each MeSH query (or set of MeSH queries) return list of descendant queries
+
+stripExtra <- function(term) {
+  substr(term, 2, nchar(term)-4)
+}
+
+getChildren <- function(term) {
+  endpoint <- 'https://id.nlm.nih.gov/mesh/sparql'
+  
+# Query to retrieve all synonym terms of the input term
+  query <- paste('PREFIX mesh: <http://id.nlm.nih.gov/mesh/>
+PREFIX mesh2015: <http://id.nlm.nih.gov/mesh/2015/>
+                  PREFIX mesh2016: <http://id.nlm.nih.gov/mesh/2016/>
+                  PREFIX meshv: <http://id.nlm.nih.gov/mesh/vocab#>
+                  PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+                  
+                  SELECT  DISTINCT ?labelA
+                  FROM <http://id.nlm.nih.gov/mesh>
+                  
+                  WHERE {{
+                  
+                  mesh:',term,' rdfs:label ?labelA .
+                  } UNION
+                  {
+                  mesh:',term,' meshv:treeNumber ?treeNum .
+                  ?childTreeNum meshv:parentTreeNumber+ ?treeNum .
+                  ?descriptorA meshv:treeNumber ?childTreeNum .
+                  ?descriptorA rdfs:label ?labelA .
+                  }}', sep = '')
+  df <- SPARQL(endpoint, query, extra="format=HTML&inference=TRUE")$results
+  colnames(df) <- NULL
+  return(toupper(sapply(df, stripExtra)))
+}
+
+for (row in 1:nrow(mortality)) {
+  mortality$MeSH.Children[row] <- paste(unlist(sapply(mortality$MeSH.IDs[[row]], getChildren)), collapse = ';')
+}
+
+mortality$MeSH.Children <- sapply(mortality$MeSH.Children, convertList)
+
+# function to invert strings with commas
+invertCommas <- function(term) {
+  s1 <- (strsplit(term, ', '))[[1]]  # split at commas
+  output <- paste(rev(s1), collapse = ' ') # reverse and collapse
+  return(output)
+}
+
+for (causeNum in 1:length(mortality$MeSH.Children)) {
+  for (termNum in 1:length(mortality$MeSH.Children[[causeNum]])) {
+    mortality$MeSH.Children[[causeNum]][[termNum]] <- invertCommas(mortality$MeSH.Children[[causeNum]][[termNum]])
+  }
+}
+
+# For each bundled set of children queries, search Federal RePORTER and return total funding
+
+getFunding <- function(terms) {
+  funding = 0
+  projects = 0
+  row = 1
+  for (row in 1:nrow(FedReporter)) {
+    if (length(intersect(terms, FedReporter$Project_Terms[row][[1]])) != 0) {
+      funding = funding + FedReporter$FY_Total_Cost[row]
+      projects = projects + 1
+    }
+  }
+  return(c(funding, projects))
+}
+
+mortality$Total.Funding <- NA
+mortality$Total.Projects <- NA
+for (row in 1:nrow(mortality)) {
+  result <- getFunding(mortality$MeSH.Children[[row]])
+  mortality$Total.Funding[row] <- result[1]
+  mortality$Total.Projects[row] <- result[2]
+}
+
+data <- select(mortality, Cause, Abbreviation, Crude.Rate, Publications, Total.Funding, Total.Projects)
+
+# Sort by mortality rate and filter top 30 causes of death for inclusion
+data <- slice(arrange(data, desc(Crude.Rate)),1:30) 
+
+```
+  
+****
+
+### Results  
+  
+#### Code to plot funding and publication volume for leading causes of death  
+  
+```{r, fig.width = 10, out.width = '100%', align = 'center'}
+# formatting for funding axis labels
+funding_format <- function(x) {
+  return(paste('$', x, 'B', sep = ''))
+}
+
+# plot log(mortality) x log(publications)
+pubs <- ggplot(data, aes(x = Crude.Rate, y = (Publications/1000))) + stat_smooth(method = "lm") + geom_point(size = 0.75, color = as.numeric(data$Abbreviation=='Gun Violence')+1) + scale_color_brewer(type = 'qual', palette = 'Set1') + geom_text_repel(aes(label = Abbreviation), size = 2.1, segment.size = 0, box.padding = unit(0.1, "lines"))  + scale_y_log10() + scale_x_log10() + annotation_logticks() + theme_bw(base_size = 10) + labs(y = "Publications (thousands)") + labs(x = "Mortality Rate (per 100,000 population)") + theme(aspect.ratio=1)
+
+# plot log(mortality) x log(funding)
+funding <- ggplot(data, aes(x = Crude.Rate, y = (Total.Funding/1000000000))) + stat_smooth(method = "lm") + geom_point(size = 0.75, color = as.numeric(data$Abbreviation=='Gun Violence')+1) + scale_color_brewer(type = 'qual', palette = 'Set1') + geom_text_repel(aes(label = Abbreviation), size = 2.1, segment.size = 0, box.padding = unit(0.1, "lines"))  + scale_y_log10(labels = funding_format) + scale_x_log10() + annotation_logticks() + theme_bw(base_size = 10) + labs(y = "Funding") + labs(x = "Mortality Rate (per 100,000 population)") + theme(aspect.ratio=1)
+
+# Combine funding and publication panels in one plot
+# Code to set equal panel widths
+gPubs <- ggplotGrob(pubs)
+gFunding <- ggplotGrob(funding)
+gPubs$widths <- gFunding$widths
+gPubs$heights <- gFunding$heights
+fig1 <- grid.arrange(gFunding, gPubs, ncol = 2)
+``` 
+  
+**Figure 1: Funding and publication volume for leading causes of death.**  
+Mortality rate versus funding (left) and publication volume (right) is plotted for 30 leading causes of death. Plotting is on a log-log scale with line of best fit included.  
+
+****
+
+To determine how research funding and publication volume correlated with mortality, two linear regression analyses were performed using mortality rate as a predictor, and funding or publication count as outcomes. The predictor and outcomes were log-transformed and studentized residuals (residual divided by estimated standard error) were calculated to determine the extent to which a given cause of death was an outlier in terms of research funding or publication volume. 
+
+#### Code to calculate predicted funding, publication volume, and studentized residuals  
+```{r}
+# Regress mortality rate on publications, calculate predicted values and residuals
+
+lm.fit <- lm(log(Publications)~ log(Crude.Rate), data = data)
+data$Publications.Predicted <- predict(lm.fit)
+data$Publications.Residuals <- rstudent(lm.fit)
+summary(lm.fit)
+
+# Regress mortality rate on funding, calculate predicted values and residuals
+
+lm.fit <- lm(log(Total.Funding)~ log(Crude.Rate), data = data)
+data$Funding.Predicted <- predict(lm.fit)
+data$Funding.Residuals <- rstudent(lm.fit)
+summary(lm.fit)
+```
+  
+**Table 1: Publication Residuals.**
+```{r pander, echo = FALSE, message = FALSE}
+# table
+
+curr <- function(x) {
+  paste('$',formatC(x, big.mark=',', format = 'f', digits = 0))
+}
+
+data_for_table <- transmute(data, Abbreviation, Crude.Rate, Publications, Publications.Predicted = exp(Publications.Predicted), Publications.Residuals,curr(Total.Funding), Funding.Predicted = curr(exp(Funding.Predicted)), Funding.Residuals)
+
+names(data_for_table) <- c('Cause of Death', 'Morality Rate (per 100,000 population)', 'Publications', 'Predicted Publications', 'Residual', 'Funding', 'Predicted Funding', 'Residual')
+
+pander(data_for_table[c(1,3,4,5)], round = c(2, 2, 2, 2, 2, 2, 2, 2),  big.mark = ',')
+```
+  
+****
+  
+**Table 2: Funding Residuals.**  
+```{r pander2, echo = FALSE, message = FALSE}
+pander(data_for_table[c(1,6,7,8)], round = c(2, 2, 2, 2, 2, 2, 2, 2),  big.mark = ',')
+```
+  
+****
+
+#### Code for residuals plot  
+```{r, fig.height = 4.5,out.width = '70%', fig.align='center'}
+# plot funding residuals x publication residuals
+fig2 <- ggplot(data, aes(x = Publications.Residuals, y = Funding.Residuals)) + geom_hline(yintercept = 0, size = 0.5, color = "gray") + geom_vline(xintercept = 0, size = 0.5, color = "gray") + geom_point(size = 0.75, color = as.numeric(data$Abbreviation=='Gun Violence')+1) + scale_color_brewer(type = 'qual', palette = 'Set1') + geom_text_repel(aes(label = Abbreviation), size = 2.1, segment.size = 0, box.padding = unit(0.1, "lines")) + theme_bw(base_size = 10) + labs(y = "Funding (Studentized Residuals)") + labs(x = "Publications (Studentized Residuals)") + theme(aspect.ratio=1)
+fig2
+
+
+```
+    
+**Figure 2: Studentized residual predicted versus observed funding and publication volumes for leading causes of death.**  
+Mortality rate was used to predict funding and research volume for 30 leading causes of death. Studentized residuals (residual divided by estimated standard error) were calculated to give a standardized estimate of predicted versus observed funding and publication volume. Publication residuals and funding residuals were plotted along the x- and y- axes, respectively.  
+
+
+```{r, echo = FALSE, message = FALSE, warning=FALSE}
+ggsave(fig2, height = 4.5, device = 'pdf', filename = 'fig2.pdf')
+ggsave(fig1, width = 7, device = 'pdf', filename = 'fig1.pdf')
+```
+
+
